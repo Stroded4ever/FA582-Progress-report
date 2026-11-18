@@ -7,7 +7,7 @@ Update this file as you go, and copy the final table into each report.
 |---|---|---|---|---|
 | Team formation | Oct 6 | | | |
 | Project proposal | Oct 27 | Proposed the sentiment-volatility topic; researched datasets (FNSPID, Yahoo Finance) and methods; drafted the proposal | | |
-| Feasibility check and EDA (proposal feedback) | Nov 17 | Wrote the R project: data download script, feasibility check and EDA report | | |
+| Feasibility check and EDA (proposal feedback) | Nov 17 | Wrote the R project: data download script, feasibility check and EDA report |Part B(adjusted code and made figures) |PartC(adjusted code) |
 | Progress report | Nov 17 | | | |
 | Modeling: course methods (regression, classification, trees, clustering) | Dec | | | |
 | Modeling: advanced comparison (FinBERT, LSTM) | Dec | | | |
