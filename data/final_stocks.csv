@@ -1,0 +1,21 @@
+ticker,company,sector,min_headlines_per_year,headlines_in_period,yahoo_symbol
+BX,Blackstone Inc.,Financials,292,5243,BX
+MS,Morgan Stanley,Financials,257,7784,MS
+WFC,Wells Fargo,Financials,221,10829,WFC
+V,Visa Inc.,Financials,221,6640,V
+KKR,KKR & Co.,Financials,212,3916,KKR
+USB,U.S. Bancorp,Financials,186,3985,USB
+ICE,Intercontinental Exchange,Financials,177,2911,ICE
+PRU,Prudential Financial,Financials,169,3059,PRU
+CME,CME Group,Financials,157,3261,CME
+NDAQ,"Nasdaq, Inc.",Financials,156,3139,NDAQ
+MU,Micron Technology,Information Technology,492,9147,MU
+QCOM,Qualcomm,Information Technology,470,8292,QCOM
+ORCL,Oracle Corporation,Information Technology,443,6767,ORCL
+TXN,Texas Instruments,Information Technology,270,5729,TXN
+ADBE,Adobe Inc.,Information Technology,257,5730,ADBE
+ACN,Accenture,Information Technology,245,3700,ACN
+FSLR,First Solar,Information Technology,175,4453,FSLR
+MRVL,Marvell Technology,Information Technology,173,3432,MRVL
+HPQ,HP Inc.,Information Technology,163,3753,HPQ
+WDC,Western Digital,Information Technology,162,5606,WDC

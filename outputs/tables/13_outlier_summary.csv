@@ -1,0 +1,3 @@
+sector,stock_days,vol_outliers,news_outliers,both,data_errors,vol_outliers_with_news_that_day
+Information Technology,27680,167,604,28,0,0.868263473053892
+Financials,27680,178,481,14,1,0.842696629213483

@@ -1,0 +1,7 @@
+sector,news_day,mean_vol_next5,stock_days
+Financials,negative tone,0.0143285590640259,3576
+Financials,neutral/positive tone,0.0130033821824209,14869
+Financials,no news,0.0120056473506808,9145
+Information Technology,negative tone,0.0171662882877775,3431
+Information Technology,neutral/positive tone,0.0158575731655291,15686
+Information Technology,no news,0.0151906392348125,8473

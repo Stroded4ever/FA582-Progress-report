@@ -1,0 +1,458 @@
+---
+title: "FA 582 Project - Data Header, Feasibility Check and Exploratory Data Analysis"
+subtitle: "Sentiment-Enhanced Volatility Forecasting"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+  word_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+options(repos = c(CRAN = "https://cloud.r-project.org"))   # needed when knitting
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 4.5)
+PROJECT_ROOT <- normalizePath(file.path(dirname(knitr::current_input(dir = TRUE)), ".."))
+source(file.path(PROJECT_ROOT, "R", "config.R"))
+
+pkgs <- c("data.table", "ggplot2", "knitr", "SentimentAnalysis")
+new  <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(new)) install.packages(new)
+suppressPackageStartupMessages({ library(data.table); library(ggplot2); library(knitr) })
+theme_set(theme_minimal(base_size = 11))
+
+save_tab <- function(x, name) fwrite(as.data.table(x), file.path(TAB_DIR, paste0(name, ".csv")))
+save_fig <- function(p, name, w = 10, h = 4.5) ggsave(file.path(FIG_DIR, paste0(name, ".png")), p, width = w, height = h, dpi = 200)
+pct <- function(x) sprintf("%.1f%%", 100 * x)
+```
+
+This report addresses the instructor's feedback on the proposal. It shows (1) a sample of the FNSPID price
+and news records with column definitions, (2) a feasibility check of the data sources, (3) return and
+volatility statistics for both sectors, (4) article counts per year, and (5) a preliminary correlation
+analysis and plots on a subset of `r length(TICKERS)` stocks (`r length(SECTORS[[1]])` Information Technology,
+`r length(SECTORS[[2]])` Financials) over `r format(START_DATE, "%Y")`-`r format(END_DATE, "%Y")`.
+All tables are saved to `outputs/tables/` and all figures to `outputs/figures/`.
+
+```{r load}
+fn_raw <- if (file.exists(F_FNSPID_PRICES)) fread(F_FNSPID_PRICES) else NULL
+yh_raw <- if (file.exists(F_YAHOO_PRICES))  fread(F_YAHOO_PRICES)  else NULL
+news   <- fread(F_NEWS_FILTERED)
+news_header <- fread(F_NEWS_HEADER)
+# keep only the stocks in the current list (the price files may be from an earlier list)
+if (!is.null(fn_raw)) { fn_raw <- fn_raw[ticker %in% TICKERS]; if (!nrow(fn_raw)) fn_raw <- NULL }
+if (!is.null(yh_raw)) { yh_raw <- yh_raw[ticker %in% TICKERS]; if (!nrow(yh_raw)) yh_raw <- NULL }
+stopifnot(!is.null(fn_raw) || !is.null(yh_raw))
+missing_yh <- if (is.null(yh_raw)) TICKERS else setdiff(TICKERS, unique(yh_raw$ticker))
+if (length(missing_yh)) warning("No Yahoo prices for: ", paste(missing_yh, collapse = ", "),
+                                " - run R/01_download_data.R with RUN_YAHOO_PRICES <- TRUE")
+```
+
+# Data header and feature definitions
+
+## FNSPID price data
+
+```{r fn-header}
+if (!is.null(fn_raw)) kable(head(fn_raw[order(ticker, date)], 6), digits = 4,
+                            caption = "First rows of the FNSPID price data")
+```
+
+| Column | Type | Definition |
+|---|---|---|
+| date | date | Trading day |
+| open | numeric (USD) | Price of the first trade of the day |
+| high | numeric (USD) | Highest traded price during the day |
+| low | numeric (USD) | Lowest traded price during the day |
+| close | numeric (USD) | Price of the last trade of the day |
+| adj_close | numeric (USD) | Close adjusted for stock splits and dividends (used for returns) |
+| volume | integer | Number of shares traded during the day |
+| ticker | text | Stock symbol (added by us from the file name) |
+
+## Yahoo Finance price data (validation / backup source)
+
+```{r yh-header}
+if (!is.null(yh_raw)) kable(head(yh_raw, 6), digits = 4, caption = "First rows of the Yahoo Finance price data (quantmod)")
+```
+
+Same fields as the FNSPID price data, downloaded with `quantmod::getSymbols()` as in Lectures 2, 4 and 5.
+
+## FNSPID news data
+
+```{r news-header}
+kable(news_header, caption = "First rows of the raw FNSPID news file (long text shortened to 120 characters)")
+```
+
+| Column | Type | Definition |
+|---|---|---|
+| Date | timestamp (UTC) | Publication date and time of the article |
+| Article_title | text | Headline of the article - the text we score for sentiment |
+| Stock_symbol | text | Ticker the article is linked to - used to merge with prices |
+| Url | text | Link to the original article |
+| Publisher | text | News outlet |
+| Author | text | Author, when available |
+| Article | text | Full article text, when available |
+| Summary columns | text | Automatic summaries produced by the FNSPID authors (LSA, Luhn, TextRank, LexRank) |
+
+## Derived features
+
+| Feature | Definition |
+|---|---|
+| ret | Daily log return: log(adj_close today / adj_close yesterday) |
+| gk_vol | Daily Garman-Klass volatility from open, high, low, close: sqrt(0.5 log(H/L)^2 - (2 log 2 - 1) log(C/O)^2) |
+| vol_lag5 | Average gk_vol over the last 5 trading days (past volatility, a HAR-RV input) |
+| vol_next5 | **Forecast target:** average gk_vol over the next 5 trading days |
+| high_vol | **Classification target:** 1 if vol_next5 is in the top 20% of the stock's 2013-2020 history |
+| sent_mean | Average Loughran-McDonald net tone of the day's headlines: (positive words - negative words) / (positive + negative words), from -1 to +1 |
+| neg_share / pos_share | Share of the day's headlines with more negative / more positive words |
+| n_articles | Number of headlines assigned to the stock on that trading day |
+| no_news | 1 if the stock had no headlines that trading day |
+
+# Feasibility check
+
+## Price data: coverage and FNSPID vs. Yahoo Finance
+
+```{r feasibility-prices}
+cover <- function(d, src) d[, .(source = src, first_date = min(date), last_date = max(date), days = .N,
+                                 missing_ohlc = sum(is.na(open) | is.na(high) | is.na(low) | is.na(close))), by = ticker]
+cov_tab <- rbind(if (!is.null(fn_raw)) cover(fn_raw, "FNSPID"), if (!is.null(yh_raw)) cover(yh_raw, "Yahoo"))
+kable(dcast(cov_tab, ticker ~ source, value.var = "days"), caption = "Trading days available per ticker, 2013-2023")
+save_tab(cov_tab, "01_price_coverage")
+# A ticker is "incomplete" in FNSPID if it is missing or its data starts/ends more than 30 days
+# inside the study period. Those tickers are taken from Yahoo Finance instead.
+fn_span <- if (is.null(fn_raw)) data.table(ticker = character(), first = as.Date(NA), last = as.Date(NA)) else
+  fn_raw[, .(first = min(as.Date(date)), last = max(as.Date(date))), by = ticker]
+complete_fn <- fn_span[first <= START_DATE + 30 & last >= END_DATE - 30, ticker]
+missing_fn  <- setdiff(TICKERS, complete_fn)
+
+# FNSPID "close" is NOT split-adjusted (e.g. AAPL ~$78 in Jan 2013) while Yahoo's close is,
+# so we compare DAILY RETURNS from the adjusted close, which do not depend on the adjustment base.
+price_decision <- "Yahoo"
+if (!is.null(fn_raw) && !is.null(yh_raw)) {
+  r <- function(d) { d <- d[, .(ticker, date = as.Date(date), adj_close)][order(ticker, date)]
+                     d[, ret := c(NA, diff(log(adj_close))), by = ticker][] }
+  cmp <- merge(r(fn_raw)[, .(ticker, date, ret_fn = ret)], r(yh_raw)[, .(ticker, date, ret_yh = ret)],
+               by = c("ticker", "date"))[!is.na(ret_fn) & !is.na(ret_yh)]
+  agree <- cmp[, .(days_matched = .N,
+                   return_correlation = cor(ret_fn, ret_yh),
+                   median_abs_diff_bp = median(abs(ret_fn - ret_yh)) * 1e4,
+                   share_days_diff_over_10bp = mean(abs(ret_fn - ret_yh) > 0.001),
+                   days_diff_over_1pct = sum(abs(ret_fn - ret_yh) > 0.01)), by = ticker]
+  worst <- cmp[abs(ret_fn - ret_yh) > 0.01][order(-abs(ret_fn - ret_yh))][, .(ticker, date, ret_fnspid = ret_fn, ret_yahoo = ret_yh)]
+  save_tab(worst, "02b_fnspid_vs_yahoo_large_differences")
+  agree <- merge(agree, fn_span, by = "ticker", all = TRUE)
+  setnames(agree, c("first", "last"), c("fnspid_first_date", "fnspid_last_date"))
+  agree[, complete_in_fnspid := ticker %in% complete_fn]
+  save_tab(agree, "02_fnspid_vs_yahoo_returns")
+  # a ticker "agrees" if no day differs by more than 1 percentage point in return
+  ok_share <- agree[complete_in_fnspid == TRUE & !is.na(days_diff_over_1pct), mean(days_diff_over_1pct == 0)]
+  if (!length(ok_share) || is.na(ok_share)) ok_share <- 0
+  if (length(complete_fn) >= 0.5 * length(TICKERS) && ok_share >= 0.9) price_decision <- "FNSPID"
+} else if (!is.null(fn_raw)) price_decision <- "FNSPID"
+```
+
+```{r show-agree, echo=FALSE}
+if (exists("agree")) kable(agree, digits = 4,
+  caption = "FNSPID vs. Yahoo Finance: agreement of daily returns (bp = basis points, 0.01%) and FNSPID coverage")
+if (exists("worst") && nrow(worst)) kable(head(worst, 15), digits = 4,
+  caption = "Largest return differences: FNSPID shows artificial jumps on these dates")
+```
+
+On a typical day FNSPID and Yahoo returns are practically identical (median difference close to 0 bp),
+but FNSPID's adjusted prices contain **artificial jumps on a few dates**
+(`r if (exists("worst") && nrow(worst)) paste(head(names(sort(table(worst$date), decreasing = TRUE)), 3), collapse = ", ") else "none"`),
+which suggests the FNSPID price files were assembled from downloads with different split/dividend adjustments.
+Because a single false jump distorts volatility, a ticker is only accepted from FNSPID if no day differs by
+more than one percentage point.
+
+**Decision:** `r length(complete_fn)` of `r length(TICKERS)` tickers have complete FNSPID price data for
+`r format(START_DATE, "%Y")`-`r format(END_DATE, "%Y")`.
+Incomplete or missing in FNSPID: `r if (length(missing_fn)) paste(missing_fn, collapse = ", ") else "none"`.
+`r if (exists("ok_share")) sprintf("For the complete tickers, FNSPID and Yahoo daily returns never differ by more than 1 percentage point for %s of them.", pct(ok_share)) else ""`
+The analysis below uses **`r price_decision`** prices
+(`r if (price_decision == "FNSPID") "Option A: FNSPID prices, with Yahoo Finance used for the incomplete tickers" else "Option B: Yahoo Finance prices"`).
+
+## News data: articles per year
+
+```{r feasibility-news}
+news[, ts := as.POSIXct(substr(Date, 1, 19), format = "%Y-%m-%d %H:%M:%S", tz = "UTC")]
+news <- news[!is.na(ts)]
+news[, `:=`(year = as.integer(format(ts, "%Y")), sector = TICKER_SECTOR[Stock_symbol])]
+per_year <- dcast(news[, .N, by = .(year, sector)], year ~ sector, value.var = "N", fill = 0)
+kable(per_year, caption = "FNSPID headlines per year for our stocks")
+save_tab(per_year, "03_news_per_year_by_sector")
+
+per_stock_year <- dcast(news[, .N, by = .(Stock_symbol, year)], Stock_symbol ~ year, value.var = "N", fill = 0)
+save_tab(per_stock_year, "04_news_per_stock_year")
+years_ok <- news[, .N, by = .(Stock_symbol, year)][, .(years_meeting_target = sum(N >= MIN_ARTICLES_YEAR)), by = Stock_symbol]
+kable(per_stock_year, caption = "Headlines per stock per year")
+```
+
+```{r news-plot}
+p <- ggplot(news[, .N, by = .(year, sector)], aes(factor(year), N, fill = sector)) +
+  geom_col(position = "dodge") + labs(x = NULL, y = "headlines", fill = NULL,
+  title = "FNSPID headlines per year (our stocks)") + theme(legend.position = "top")
+save_fig(p, "01_news_per_year"); p
+```
+
+`r nrow(years_ok[years_meeting_target == length(unique(news$year))])` of `r nrow(years_ok)` stocks have at
+least `r MIN_ARTICLES_YEAR` headlines in every year of the period.
+
+# Feature construction
+
+```{r features}
+if (price_decision == "FNSPID") {
+  prices <- copy(fn_raw[ticker %in% complete_fn])[, price_source := "FNSPID"]
+  if (length(missing_fn) && !is.null(yh_raw))                                   # fill gaps from Yahoo
+    prices <- rbind(prices, copy(yh_raw[ticker %in% missing_fn])[, price_source := "Yahoo"], fill = TRUE)
+} else prices <- copy(yh_raw)[, price_source := "Yahoo"]
+prices <- prices[ticker %in% TICKERS & !is.na(open) & !is.na(high) & !is.na(low) & !is.na(close) & close > 0]
+prices[, `:=`(date = as.Date(date), sector = TICKER_SECTOR[ticker])]
+setorder(prices, ticker, date)
+prices[, ret := c(NA, diff(log(adj_close))), by = ticker]
+prices[, gk_vol := sqrt(pmax(0.5 * log(high / low)^2 - (2 * log(2) - 1) * log(close / open)^2, 0))]
+prices[, vol_lag5  := frollmean(gk_vol, 5), by = ticker]
+prices[, vol_next5 := shift(frollmean(gk_vol, 5), 5, type = "lead"), by = ticker]
+thr <- prices[date <= TRAIN_END, .(thr = quantile(vol_next5, HIGH_VOL_QUANTILE, na.rm = TRUE)), by = ticker]
+prices <- merge(prices, thr, by = "ticker")
+prices[, high_vol := as.integer(vol_next5 > thr)]
+
+# --- Loughran-McDonald dictionary sentiment (text to numeric, Lecture 2) -------
+data("DictionaryLM", package = "SentimentAnalysis")
+lm_pos <- tolower(DictionaryLM[[grep("pos", names(DictionaryLM), ignore.case = TRUE)[1]]])
+lm_neg <- tolower(DictionaryLM[[grep("neg", names(DictionaryLM), ignore.case = TRUE)[1]]])
+words  <- strsplit(tolower(news$Article_title), "[^a-z']+")
+news[, `:=`(n_pos = vapply(words, function(w) sum(w %in% lm_pos), 0L),
+            n_neg = vapply(words, function(w) sum(w %in% lm_neg), 0L))]
+news[, tone := fifelse(n_pos + n_neg > 0, (n_pos - n_neg) / (n_pos + n_neg), 0)]
+
+# --- Align news to trading days: after 4pm New York time -> next trading day ---
+ny <- as.POSIXlt(news$ts, tz = "America/New_York")
+news[, cal_day := as.Date(format(ny, "%Y-%m-%d")) + as.integer(ny$hour >= 16)]
+tdays <- sort(unique(prices$date))
+pos <- findInterval(as.numeric(news$cal_day) - 1, as.numeric(tdays)) + 1   # first trading day >= cal_day
+news[, trade_date := tdays[pmin(pos, length(tdays))]]
+news <- news[pos <= length(tdays)]
+
+if (!"mentions_company" %in% names(news)) news[, mentions_company := NA]   # added by 03_select_stocks.R
+
+# --- FinBERT scores (advanced method, from python/finbert_scores.ipynb), if available ---
+F_FINBERT <- file.path(DATA_DIR, "finbert_scores.csv")
+HAS_FB <- file.exists(F_FINBERT)
+if (HAS_FB) {
+  fb <- unique(fread(F_FINBERT, colClasses = c(Stock_symbol = "character", Date = "character", Article_title = "character")),
+               by = c("Stock_symbol", "Date", "Article_title"))
+  news <- merge(news, fb[, .(Stock_symbol, Date, Article_title, fb_pos, fb_neg, fb_label)],
+                by = c("Stock_symbol", "Date", "Article_title"), all.x = TRUE)
+  message(sprintf("FinBERT scores matched for %s of headlines", pct(mean(!is.na(news$fb_pos)))))
+} else news[, `:=`(fb_pos = NA_real_, fb_neg = NA_real_, fb_label = NA_character_)]
+
+daily <- news[, .(sent_mean = mean(tone), neg_share = mean(n_neg > n_pos), pos_share = mean(n_pos > n_neg),
+                  n_articles = .N, n_named = sum(mentions_company %in% TRUE),
+                  fb_sent_mean = mean(fb_pos - fb_neg, na.rm = TRUE),
+                  fb_neg_share = mean(fb_label == "negative", na.rm = TRUE),
+                  fb_pos_share = mean(fb_label == "positive", na.rm = TRUE)), by = .(ticker = Stock_symbol, date = trade_date)]
+for (v in c("fb_sent_mean", "fb_neg_share", "fb_pos_share")) set(daily, which(!is.finite(daily[[v]])), v, NA_real_)
+df <- merge(prices, daily, by = c("ticker", "date"), all.x = TRUE)
+df[, no_news := as.integer(is.na(n_articles))]
+for (v in c("sent_mean", "neg_share", "pos_share", "n_articles", "n_named", "fb_sent_mean", "fb_neg_share", "fb_pos_share"))
+  set(df, which(is.na(df[[v]])), v, 0)
+kable(head(df[!is.na(vol_next5) & n_articles > 0,
+              .(ticker, date, sector, ret, gk_vol, vol_lag5, vol_next5, high_vol, sent_mean, neg_share, n_articles)], 6),
+      digits = 4, caption = "Sample of the merged price + sentiment dataset")
+save_tab(head(df, 20), "05_merged_sample")
+
+```
+
+Share of headlines containing at least one Loughran-McDonald word: **`r pct(mean(news$n_pos + news$n_neg > 0))`**.
+Share of stock-days with at least one headline: **`r pct(mean(df$no_news == 0))`**.
+
+# Outlier analysis
+
+Course method (outlier analysis): a day is flagged when it is far from **that stock's own** typical level.
+Volatility is roughly log-normal, so we use a z-score of log volatility.
+
+- `outlier_vol` = 1 if |z| of log(gk_vol) > 3 within the stock
+- `outlier_news` = 1 if the number of headlines is more than 3 standard deviations above the stock's mean
+- `data_error` = 1 for impossible or suspicious prices: |daily return| > 40%, high < low, high = low, or an intraday
+  low/high more than 30% away from the day's open and close (freak trades such as the 2015-08-24 flash crash)
+
+```{r outliers}
+df[, z_logvol := { v <- log(pmax(gk_vol, 1e-6)); (v - mean(v, na.rm = TRUE)) / sd(v, na.rm = TRUE) }, by = ticker]
+df[, outlier_vol := as.integer(abs(z_logvol) > 3)]
+df[, z_news := { m <- mean(n_articles); s <- sd(n_articles); if (s > 0) (n_articles - m) / s else 0 }, by = ticker]
+df[, outlier_news := as.integer(z_news > 3 & n_articles > 0)]
+df[, data_error := as.integer((is.finite(ret) & abs(ret) > 0.4) | high < low | high == low |
+                              low < 0.7 * pmin(open, close) | high > 1.3 * pmax(open, close))]   # freak prints, e.g. KKR low $8 on 2015-08-24
+for (v in c("outlier_vol", "outlier_news", "data_error")) set(df, which(is.na(df[[v]])), v, 0L)
+
+out_sum <- df[, .(stock_days = .N, vol_outliers = sum(outlier_vol), news_outliers = sum(outlier_news),
+                  both = sum(outlier_vol & outlier_news), data_errors = sum(data_error),
+                  vol_outliers_with_news_that_day = mean(n_articles[outlier_vol == 1] > 0)), by = sector]
+kable(out_sum, digits = 3, caption = "Outlier counts by sector")
+save_tab(out_sum, "13_outlier_summary")
+
+top_out <- df[outlier_vol == 1][order(-z_logvol)][, .(ticker, sector, date, gk_vol, z_logvol, ret, n_articles, sent_mean)]
+kable(head(top_out, 12), digits = 4, caption = "Largest volatility outliers")
+save_tab(top_out, "14_volatility_outliers")
+by_year <- df[, .(vol_outliers = sum(outlier_vol), news_outliers = sum(outlier_news)), by = .(year = year(date), sector)]
+p <- ggplot(by_year, aes(factor(year), vol_outliers, fill = sector)) + geom_col(position = "dodge") +
+  labs(x = NULL, y = "stock-days", fill = NULL, title = "Volatility outliers (|z| > 3) per year") + theme(legend.position = "top")
+save_fig(p, "07_outliers_per_year"); p
+```
+
+On volatility-outlier days, the stock had news that day in
+**`r pct(df[outlier_vol == 1, mean(n_articles > 0)])`** of cases, compared with
+**`r pct(df[, mean(n_articles > 0)])`** of all stock-days.
+
+```{r write-features}
+# Shared modeling file for Parts B and C (Part A replaces it when features improve; columns are only ever added)
+fwrite(df[, .(ticker, sector, date, ret, gk_vol, vol_lag5, vol_next5, high_vol,
+              sent_mean, neg_share, pos_share, n_articles, n_named, no_news,
+              fb_sent_mean, fb_neg_share, fb_pos_share, outlier_vol, outlier_news, data_error, price_source)],
+       file.path(DATA_DIR, "features_daily.csv"))
+```
+
+```{r finbert-accuracy, echo=FALSE}
+F_FB_ACC <- file.path(DATA_DIR, "finbert_accuracy.csv")
+if (file.exists(F_FB_ACC)) kable(fread(F_FB_ACC), digits = 3, caption = "FinBERT accuracy on labeled financial text")
+if (HAS_FB) kable(news[!is.na(fb_label), .N, by = .(sector, FinBERT_label = fb_label)][, share := N / sum(N), by = sector][order(sector, FinBERT_label)],
+                  digits = 3, caption = "FinBERT label distribution of headlines by sector")
+```
+
+# Summary statistics
+
+```{r summary-stats}
+moments <- function(x) { x <- x[is.finite(x)]; m <- mean(x); s <- sd(x)
+  c(mean = m, sd = s, skewness = mean((x - m)^3) / s^3, kurtosis = mean((x - m)^4) / s^4,
+    min = min(x), max = max(x)) }
+stats <- rbindlist(lapply(split(df, df$sector), function(g) data.table(
+  sector = g$sector[1], stock_days = nrow(g),
+  t(setNames(moments(g$ret),  paste0("ret_", names(moments(g$ret))))),
+  vol_mean = mean(g$gk_vol, na.rm = TRUE), vol_median = median(g$gk_vol, na.rm = TRUE),
+  vol_sd = sd(g$gk_vol, na.rm = TRUE), vol_max = max(g$gk_vol, na.rm = TRUE),
+  avg_volume = mean(g$volume, na.rm = TRUE),
+  articles_per_stock_day = mean(g$n_articles), share_days_with_news = mean(g$no_news == 0),
+  mean_sentiment_news_days = mean(g$sent_mean[g$no_news == 0]))))
+stats_long <- melt(stats, id.vars = "sector", variable.name = "statistic")
+stats_wide <- dcast(stats_long, statistic ~ sector, value.var = "value")
+kable(stats_wide, digits = 5, caption = "Return, volatility, volume and news statistics by sector, 2013-2023")
+save_tab(stats_wide, "06_summary_statistics_by_sector")
+
+kable(df[, .(ret_sd = sd(ret, na.rm = TRUE), vol_mean = mean(gk_vol, na.rm = TRUE),
+             articles = sum(n_articles), mean_tone = mean(sent_mean[no_news == 0])), by = .(sector, ticker)][order(sector, ticker)],
+      digits = 4, caption = "Per-stock statistics")
+```
+
+# Visual analysis
+
+```{r plot-vol}
+events <- data.table(name  = c("Aug 2015 sell-off", "Feb 2018 vol spike", "COVID-19 crash", "2022 rate hikes", "Mar 2023 bank failures"),
+                     start = as.Date(c("2015-08-17", "2018-02-01", "2020-02-20", "2022-01-01", "2023-03-08")),
+                     end   = as.Date(c("2015-09-04", "2018-02-15", "2020-04-15", "2022-12-31", "2023-03-31")))
+sv <- df[, .(vol = mean(gk_vol, na.rm = TRUE)), by = .(date, sector)][order(sector, date)]
+sv[, vol21 := frollmean(vol, 21), by = sector]
+p <- ggplot(sv, aes(date, vol21, colour = sector)) +
+  geom_rect(data = events, aes(xmin = start, xmax = end, ymin = -Inf, ymax = Inf), inherit.aes = FALSE, fill = "grey60", alpha = 0.25) +
+  geom_text(data = events, aes(x = start, y = Inf, label = name), inherit.aes = FALSE, angle = 90, hjust = 1.05, vjust = -0.3, size = 2.7) +
+  geom_line(linewidth = 0.6) + labs(x = NULL, y = "daily volatility (21-day mean)", colour = NULL,
+  title = "Average daily Garman-Klass volatility by sector") + theme(legend.position = "top")
+save_fig(p, "02_volatility_by_sector"); p
+```
+
+```{r plot-returns, fig.height=3.8}
+p <- ggplot(df[is.finite(ret)], aes(ret, fill = sector)) + geom_histogram(bins = 150, alpha = 0.8) +
+  coord_cartesian(xlim = c(-0.12, 0.12)) + facet_wrap(~sector) + guides(fill = "none") +
+  labs(x = "daily log return", y = "count", title = "Distribution of daily log returns")
+save_fig(p, "03_return_distribution", h = 3.8); p
+```
+
+```{r plot-sentiment}
+ms <- df[no_news == 0, .(tone = mean(sent_mean)), by = .(month = as.Date(format(date, "%Y-%m-01")), sector)]
+mv <- df[, .(vol = mean(gk_vol, na.rm = TRUE)), by = .(month = as.Date(format(date, "%Y-%m-01")), sector)]
+m  <- merge(ms, mv, by = c("month", "sector"))
+k  <- m[, max(vol) / max(abs(tone))]
+p <- ggplot(m, aes(month)) + geom_line(aes(y = vol, colour = "volatility")) +
+  geom_line(aes(y = tone * k, colour = "news tone (rescaled)"), alpha = 0.8) + facet_wrap(~sector, ncol = 1) +
+  scale_colour_manual(values = c("volatility" = "black", "news tone (rescaled)" = "steelblue")) +
+  labs(x = NULL, y = NULL, colour = NULL, title = "Monthly average volatility and headline tone") + theme(legend.position = "top")
+save_fig(p, "04_volatility_vs_tone", h = 6); p
+```
+
+# Relationships between features
+
+```{r correlations}
+feats <- c("vol_lag5", "gk_vol", "ret", "sent_mean", "neg_share", "pos_share", "n_articles", "no_news")
+if (HAS_FB) feats <- c(feats, "fb_sent_mean", "fb_neg_share", "fb_pos_share")
+d <- df[!is.na(vol_next5) & !is.na(vol_lag5) & is.finite(ret)]
+cor_tab <- rbindlist(lapply(feats, function(f) d[, .(feature = f,
+  pearson = cor(get(f), vol_next5), spearman = cor(get(f), vol_next5, method = "spearman")), by = sector]))
+cor_wide <- dcast(cor_tab, feature ~ sector, value.var = c("pearson", "spearman"))
+kable(cor_wide, digits = 3, caption = "Correlation of each feature with next-5-day volatility (vol_next5), by sector")
+save_tab(cor_wide, "07_correlation_with_target")
+```
+
+```{r cor-matrix, fig.width=7, fig.height=6}
+cm <- cor(d[, c(feats, "vol_next5"), with = FALSE])
+cml <- as.data.table(as.table(cm))
+p <- ggplot(cml, aes(V1, V2, fill = N)) + geom_tile() + geom_text(aes(label = sprintf("%.2f", N)), size = 3) +
+  scale_fill_gradient2(limits = c(-1, 1), low = "#b2182b", high = "#2166ac") +
+  labs(x = NULL, y = NULL, fill = "r", title = "Correlation matrix (all stocks)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+save_fig(p, "05_correlation_matrix", w = 7, h = 6); p
+```
+
+```{r group-compare}
+cmp_tab <- d[, .(mean_vol_next5 = mean(vol_next5), stock_days = .N), by = .(sector,
+  news_day = fifelse(no_news == 1, "no news", fifelse(sent_mean < 0, "negative tone", "neutral/positive tone")))][order(sector, news_day)]
+kable(cmp_tab, digits = 5, caption = "Average next-5-day volatility by type of news day")
+save_tab(cmp_tab, "08_volatility_by_news_type")
+tt <- d[no_news == 0, t.test(vol_next5[sent_mean < 0], vol_next5[sent_mean >= 0])]
+```
+
+On days with news, next-week volatility averages `r sprintf("%.5f", tt$estimate[1])` after negative-tone days
+vs. `r sprintf("%.5f", tt$estimate[2])` after neutral/positive days (Welch t-test p-value = `r format.pval(tt$p.value, digits = 3)`).
+
+```{r event-study}
+neg_days <- d[no_news == 0 & sent_mean <= quantile(sent_mean, 0.05), .(ticker, date)]
+setkey(df, ticker, date); df[, idx := seq_len(.N), by = ticker]
+ev <- merge(neg_days, df[, .(ticker, date, idx)], by = c("ticker", "date"))
+win <- rbindlist(lapply(seq_len(nrow(ev)), function(i) {
+  g <- df[.(ev$ticker[i])][idx %between% c(ev$idx[i] - 10, ev$idx[i] + 10)]
+  base <- mean(g[idx < ev$idx[i], gk_vol], na.rm = TRUE)
+  if (nrow(g) == 21 && is.finite(base) && base > 0) data.table(k = -10:10, rel = g$gk_vol / base, sector = g$sector[1])
+}))
+es <- win[, .(rel = mean(rel, na.rm = TRUE)), by = .(k, sector)]
+p <- ggplot(es, aes(k, rel, colour = sector)) + geom_hline(yintercept = 1, colour = "grey50") +
+  geom_vline(xintercept = 0, linetype = 2, colour = "red") + geom_line() + geom_point(size = 1.2) +
+  labs(x = "trading days from very negative news day", y = "volatility / pre-event average", colour = NULL,
+       title = sprintf("Volatility around very negative news days (%d events)", nrow(ev))) + theme(legend.position = "top")
+save_fig(p, "06_event_study"); p
+```
+
+# Preliminary model check (course method: logistic regression)
+
+A first look at RQ3 with a course method (Lecture 5): logistic regression for high-volatility weeks,
+trained on 2013-2020 and tested on 2022-2023, **with and without** sentiment features.
+
+```{r prelim-logit}
+md <- d[!is.na(high_vol)]
+train <- md[date <= TRAIN_END]; test <- md[date > VALID_END]
+fit_eval <- function(f, label) {
+  m <- glm(f, data = train, family = binomial)
+  p <- predict(m, test, type = "response"); y <- test$high_vol; yhat <- as.integer(p > 0.5)
+  data.table(model = label, accuracy = mean(yhat == y), sensitivity = mean(yhat[y == 1] == 1),
+             specificity = mean(yhat[y == 0] == 0), brier = mean((p - y)^2))
+}
+res <- rbind(
+  fit_eval(high_vol ~ vol_lag5 + gk_vol + abs(ret) + sector, "price only"),
+  fit_eval(high_vol ~ vol_lag5 + gk_vol + abs(ret) + sector + sent_mean + neg_share + n_articles + no_news, "price + sentiment"))
+kable(res, digits = 4, caption = "Logistic regression, test period 2022-2023")
+save_tab(res, "09_prelim_logistic_regression")
+```
+
+# Session information
+
+```{r session}
+sessionInfo()
+```
