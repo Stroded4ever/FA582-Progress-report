@@ -1,0 +1,34 @@
+# Data: only the small files that the project needs are pushed to GitHub.
+# Large downloads (raw/, news parts, the universe news file, FNSPID prices) stay local.
+data/*
+!data/.gitkeep
+!data/features_daily.csv
+!data/news_filtered.csv
+!data/yahoo_prices.csv
+!data/final_stocks.csv
+!data/final_study_period.txt
+!data/sp500_constituents.csv
+!data/fnspid_news_header.csv
+!data/news_scan_counts.csv
+!data/news_universe_scan_counts.csv
+!data/finbert_scores.csv
+!data/finbert_accuracy.csv
+
+# R / RStudio
+.Rhistory
+.RData
+.Rproj.user/
+*.Rcheck/
+
+# Knitted reports (re-create by clicking Knit)
+reports/*.html
+reports/*.docx
+reports/*_files/
+reports/*_cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Personal secrets (Hugging Face token) - never commit
+.Renviron
