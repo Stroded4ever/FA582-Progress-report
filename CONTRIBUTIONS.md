@@ -3,7 +3,7 @@
 The course requires listing each member's contribution at **every phase**, including the proposal.
 Update this file as you go, and copy the final table into each report.
 
-| Phase | Due | Dinithi Samarakoon | Member 2 | Member 3 |
+| Phase | Due | Dinithi Samarakoon | Josh | Ginevra |
 |---|---|---|---|---|
 | Team formation | Oct 6 | | | |
 | Project proposal | Oct 27 | Proposed the sentiment-volatility topic; researched datasets (FNSPID, Yahoo Finance) and methods; drafted the proposal | | |
